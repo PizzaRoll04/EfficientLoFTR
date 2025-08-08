@@ -23,7 +23,7 @@ python ./test.py \
     ${main_cfg_path} \
     --ckpt_path=${ckpt_path} \
     --dump_dir=${dump_dir} \
-    --gpus=${n_gpus_per_node} --num_nodes=${n_nodes} --accelerator="ddp" \
+    --gpus=${n_gpus_per_node} --num_nodes=${n_nodes} --accelerator="cuda" \
     --batch_size=${batch_size} --num_workers=${torch_num_workers}\
     --profiler_name=${profiler_name} \
     --benchmark \
