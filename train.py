@@ -9,7 +9,14 @@ import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-from pytorch_lightning.plugins import DDPPlugin, NativeMixedPrecisionPlugin
+
+# from pytorch_lightning.plugins import DDPPlugin, NativeMixedPrecisionPlugin
+from pytorch_lightning.strategies import DDPStrategy  # , FSDPMixedPrecisionPlugin
+from pytorch_lightning import LightningDataModule
+
+# from pytorch_lightning.plugins.precision import (
+#     NativeMixedPrecisionPlugin,
+# )
 
 from src.config.default import get_cfg_defaults
 from src.utils.misc import get_rank_zero_only_logger, setup_gpus
@@ -21,57 +28,89 @@ import torch
 loguru_logger = get_rank_zero_only_logger(loguru_logger)
 
 import os
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+
 
 def parse_args():
     # init a costum parser which will be added into pl.Trainer parser
     # check documentation: https://pytorch-lightning.readthedocs.io/en/latest/common/trainer.html#trainer-flags
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("data_cfg_path", type=str, help="data config path")
+    parser.add_argument("main_cfg_path", type=str, help="main config path")
+    parser.add_argument("--exp_name", type=str, default="default_exp_name")
+    parser.add_argument("--batch_size", type=int, default=4, help="batch_size per gpu")
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument(
-        'data_cfg_path', type=str, help='data config path')
+        "--pin_memory",
+        type=lambda x: bool(strtobool(x)),
+        nargs="?",
+        default=True,
+        help="whether loading data to pinned memory or not",
+    )
     parser.add_argument(
-        'main_cfg_path', type=str, help='main config path')
+        "--ckpt_path",
+        type=str,
+        default=None,
+        help="pretrained checkpoint path, helpful for using a pre-trained coarse-only LoFTR",
+    )
     parser.add_argument(
-        '--exp_name', type=str, default='default_exp_name')
+        "--disable_ckpt",
+        action="store_true",
+        help="disable checkpoint saving (useful for debugging).",
+    )
     parser.add_argument(
-        '--batch_size', type=int, default=4, help='batch_size per gpu')
+        "--profiler_name",
+        type=str,
+        default=None,
+        help="options: [inference, pytorch], or leave it unset",
+    )
     parser.add_argument(
-        '--num_workers', type=int, default=4)
+        "--parallel_load_data",
+        action="store_true",
+        help="load datasets in with multiple processes.",
+    )
+    parser.add_argument("--thr", type=float, default=0.1)
     parser.add_argument(
-        '--pin_memory', type=lambda x: bool(strtobool(x)),
-        nargs='?', default=True, help='whether loading data to pinned memory or not')
+        "--train_coarse_percent",
+        type=float,
+        default=0.1,
+        help="training tricks: save GPU memory",
+    )
     parser.add_argument(
-        '--ckpt_path', type=str, default=None,
-        help='pretrained checkpoint path, helpful for using a pre-trained coarse-only LoFTR')
+        "--disable_mp", action="store_true", help="disable mixed-precision training"
+    )
     parser.add_argument(
-        '--disable_ckpt', action='store_true',
-        help='disable checkpoint saving (useful for debugging).')
-    parser.add_argument(
-        '--profiler_name', type=str, default=None,
-        help='options: [inference, pytorch], or leave it unset')
-    parser.add_argument(
-        '--parallel_load_data', action='store_true',
-        help='load datasets in with multiple processes.')
-    parser.add_argument(
-        '--thr', type=float, default=0.1)
-    parser.add_argument(
-        '--train_coarse_percent', type=float, default=0.1, help='training tricks: save GPU memory')
-    parser.add_argument(
-        '--disable_mp', action='store_true', help='disable mixed-precision training')
-    parser.add_argument(
-        '--deter', action='store_true', help='use deterministic mode for training')
+        "--deter", action="store_true", help="use deterministic mode for training"
+    )
 
-    parser = pl.Trainer.add_argparse_args(parser)
+    parser.add_argument("--gpus", type=int, default=1)  # legacy; maps to devices
+    parser.add_argument("--num_nodes", type=int, default=1)
+    parser.add_argument("--accelerator", type=str, default="gpu")
+    parser.add_argument("--check_val_every_n_epoch", type=int, default=1)
+    parser.add_argument("--log_every_n_steps", type=int, default=50)
+    parser.add_argument("--flush_logs_every_n_steps", type=int, default=1000)
+    parser.add_argument("--limit_val_batches", type=float, default=1.0)
+    parser.add_argument("--num_sanity_val_steps", type=int, default=2)
+    parser.add_argument(
+        "--benchmark", type=lambda x: x.lower() == "true", default=False
+    )
+    parser.add_argument("--max_epochs", type=int, default=30)
     return parser.parse_args()
+
 
 def inplace_relu(m):
     classname = m.__class__.__name__
-    if classname.find('ReLU') != -1:
-        m.inplace=True
+    if classname.find("ReLU") != -1:
+        m.inplace = True
+
 
 def main():
     # parse arguments
     args = parse_args()
+    print(args.precision)
     rank_zero_only(pprint.pprint)(vars(args))
 
     # init default-cfg and merge it with the main- and data-cfg
@@ -80,10 +119,15 @@ def main():
     config = get_cfg_default()
     config.merge_from_file(args.main_cfg_path)
     config.merge_from_file(args.data_cfg_path)
-    
+
     if config.LOFTR.COARSE.NPE is None:
-        config.LOFTR.COARSE.NPE = [832, 832, 832, 832]  # training at 832 resolution on MegaDepth datasets
-    
+        config.LOFTR.COARSE.NPE = [
+            832,
+            832,
+            832,
+            832,
+        ]  # training at 832 resolution on MegaDepth datasets
+
     if args.deter:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -91,7 +135,7 @@ def main():
     pl.seed_everything(config.TRAINER.SEED)  # reproducibility
     # TODO: Use different seeds for each dataloader workers
     # This is needed for data augmentation
-    
+
     # scale lr and warmup-step automatically
     args.gpus = _n_gpus = setup_gpus(args.gpus)
     config.TRAINER.WORLD_SIZE = _n_gpus * args.num_nodes
@@ -116,39 +160,47 @@ def main():
     loguru_logger.info(f"LoFTR DataModule initialized!")
 
     # TensorBoard Logger
-    logger = TensorBoardLogger(save_dir='logs/tb_logs', name=args.exp_name, default_hp_metric=False)
-    ckpt_dir = Path(logger.log_dir) / 'checkpoints'
+    logger = TensorBoardLogger(
+        save_dir="logs/tb_logs", name=args.exp_name, default_hp_metric=False
+    )
+    ckpt_dir = Path(logger.log_dir) / "checkpoints"
 
     # Callbacks
     # TODO: update ModelCheckpoint to monitor multiple metrics
-    ckpt_callback = ModelCheckpoint(monitor='auc@10', verbose=True, save_top_k=5, mode='max',
-                                    save_last=True,
-                                    dirpath=str(ckpt_dir),
-                                    filename='{epoch}-{auc@5:.3f}-{auc@10:.3f}-{auc@20:.3f}')
-    lr_monitor = LearningRateMonitor(logging_interval='step')
+    ckpt_callback = ModelCheckpoint(
+        monitor="auc@10",
+        verbose=True,
+        save_top_k=5,
+        mode="max",
+        save_last=True,
+        dirpath=str(ckpt_dir),
+        filename="{epoch}-{auc@5:.3f}-{auc@10:.3f}-{auc@20:.3f}",
+    )
+    lr_monitor = LearningRateMonitor(logging_interval="step")
     callbacks = [lr_monitor]
     if not args.disable_ckpt:
         callbacks.append(ckpt_callback)
 
     # Lightning Trainer
-    trainer = pl.Trainer.from_argparse_args(
-        args,
-        plugins=[DDPPlugin(find_unused_parameters=False,
-                          num_nodes=args.num_nodes,
-                          sync_batchnorm=config.TRAINER.WORLD_SIZE > 0), NativeMixedPrecisionPlugin()],
+    # trainer = pl.Trainer.from_argparse_args(
+    trainer = pl.Trainer(
+        vars(args),
+        strategy=DDPStrategy(find_unused_parameters=False),
         gradient_clip_val=config.TRAINER.GRADIENT_CLIPPING,
         callbacks=callbacks,
         logger=logger,
-        sync_batchnorm=config.TRAINER.WORLD_SIZE > 0,
-        replace_sampler_ddp=False,  # use custom sampler
-        reload_dataloaders_every_epoch=False,  # avoid repeated samples!
-        weights_summary='full',
-        profiler=profiler)
+        sync_batchnorm=(config.TRAINER.WORLD_SIZE > 0),
+        use_distributed_sampler=False,  # use custom sampler
+        reload_dataloaders_every_n_epochs=0,  # avoid repeated samples!
+        enable_model_summary=True,
+        num_nodes=getattr(args, "num_nodes", 1),
+        profiler=profiler,
+    )
     loguru_logger.info(f"Trainer initialized!")
     loguru_logger.info(f"Start training!")
 
     trainer.fit(model, datamodule=data_module)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
