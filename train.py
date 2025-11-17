@@ -1,3 +1,7 @@
+import torch
+
+torch.autograd.set_detect_anomaly(True)
+
 import math
 import argparse
 import pprint
@@ -23,7 +27,7 @@ from src.utils.misc import get_rank_zero_only_logger, setup_gpus
 from src.utils.profiler import build_profiler
 from src.lightning.data import MultiSceneDataModule
 from src.lightning.lightning_loftr import PL_LoFTR
-import torch
+
 
 loguru_logger = get_rank_zero_only_logger(loguru_logger)
 
@@ -110,7 +114,7 @@ def inplace_relu(m):
 def main():
     # parse arguments
     args = parse_args()
-    print(args.precision)
+    # print(args.precision)
     rank_zero_only(pprint.pprint)(vars(args))
 
     # init default-cfg and merge it with the main- and data-cfg
@@ -122,10 +126,10 @@ def main():
 
     if config.LOFTR.COARSE.NPE is None:
         config.LOFTR.COARSE.NPE = [
-            832,
-            832,
-            832,
-            832,
+            config.DATASET.MGDPT_IMG_RESIZE,
+            config.DATASET.MGDPT_IMG_RESIZE,
+            config.DATASET.MGDPT_IMG_RESIZE,
+            config.DATASET.MGDPT_IMG_RESIZE,
         ]  # training at 832 resolution on MegaDepth datasets
 
     if args.deter:
@@ -143,6 +147,9 @@ def main():
     _scaling = config.TRAINER.TRUE_BATCH_SIZE / config.TRAINER.CANONICAL_BS
     config.TRAINER.SCALING = _scaling
     config.TRAINER.TRUE_LR = config.TRAINER.CANONICAL_LR * _scaling
+    print(f"config.TRAINER.TRUE_BATCH_SIZE: {config.TRAINER.TRUE_BATCH_SIZE}")
+    print(f"config.TRAINER.SCALING: {config.TRAINER.SCALING}")
+    print(f"config.TRAINER.TRUE_LR: {config.TRAINER.TRUE_LR}")
     config.TRAINER.WARMUP_STEP = math.floor(config.TRAINER.WARMUP_STEP / _scaling)
 
     if args.thr is not None:
@@ -182,9 +189,32 @@ def main():
         callbacks.append(ckpt_callback)
 
     # Lightning Trainer
-    # trainer = pl.Trainer.from_argparse_args(
+    argdict = vars(args).copy()
+    allowed = {
+        "accelerator",
+        "devices",
+        "num_nodes",
+        "precision",
+        "max_epochs",
+        "max_steps",
+        "limit_train_batches",
+        "limit_val_batches",
+        "log_every_n_steps",
+        "check_val_every_n_epoch",
+        "deterministic",
+        "benchmark",
+        "default_root_dir",
+        "gradient_clip_val",
+        "accumulate_grad_batches",
+        "enable_model_summary",
+        "reload_dataloaders_every_n_epochs",
+        "inference_mode",
+        "fast_dev_run",
+    }
+    trainer_kwargs = {k: v for k, v in argdict.items() if k in allowed}
+    print("num_nodes" in trainer_kwargs)
     trainer = pl.Trainer(
-        vars(args),
+        **trainer_kwargs,
         strategy=DDPStrategy(find_unused_parameters=False),
         gradient_clip_val=config.TRAINER.GRADIENT_CLIPPING,
         callbacks=callbacks,
@@ -193,7 +223,6 @@ def main():
         use_distributed_sampler=False,  # use custom sampler
         reload_dataloaders_every_n_epochs=0,  # avoid repeated samples!
         enable_model_summary=True,
-        num_nodes=getattr(args, "num_nodes", 1),
         profiler=profiler,
     )
     loguru_logger.info(f"Trainer initialized!")

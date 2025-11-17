@@ -1,3 +1,11 @@
+import os
+
+os.environ.setdefault("MPLBACKEND", "Agg")
+import matplotlib
+
+matplotlib.use("Agg", force=True)
+import matplotlib.pyplot as plt
+
 from collections import defaultdict
 import pprint
 from loguru import logger
@@ -6,7 +14,6 @@ from pathlib import Path
 import torch
 import numpy as np
 import pytorch_lightning as pl
-from matplotlib import pyplot as plt
 
 from src.loftr import LoFTR
 from src.loftr.utils.supervision import (
@@ -94,27 +101,30 @@ class PL_LoFTR(pl.LightningModule):
 
     def optimizer_step(
         self,
-        epoch,
-        batch_idx,
+        epoch: int,
+        batch_idx: int,
         optimizer,
-        optimizer_idx,
         optimizer_closure,
-        on_tpu,
-        using_native_amp,
-        using_lbfgs,
+        on_tpu: bool = False,
+        using_native_amp: bool = False,
+        using_lbfgs: bool = False,
     ):
         # learning rate warm up
         warmup_step = self.config.TRAINER.WARMUP_STEP
         if self.trainer.global_step < warmup_step:
             if self.config.TRAINER.WARMUP_TYPE == "linear":
                 base_lr = self.config.TRAINER.WARMUP_RATIO * self.config.TRAINER.TRUE_LR
-                lr = base_lr + (
-                    self.trainer.global_step / self.config.TRAINER.WARMUP_STEP
-                ) * abs(self.config.TRAINER.TRUE_LR - base_lr)
+                lr = base_lr + (self.trainer.global_step / warmup_step) * abs(
+                    self.config.TRAINER.TRUE_LR - base_lr
+                )
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
             elif self.config.TRAINER.WARMUP_TYPE == "constant":
-                pass
+                # keep lr at base ratio until warmup ends
+                for pg in optimizer.param_groups:
+                    pg["lr"] = (
+                        self.config.TRAINER.WARMUP_RATIO * self.config.TRAINER.TRUE_LR
+                    )
             else:
                 raise ValueError(
                     f"Unknown lr warm-up strategy: {self.config.TRAINER.WARMUP_TYPE}"
@@ -168,9 +178,13 @@ class PL_LoFTR(pl.LightningModule):
         return ret_dict, rel_pair_names
 
     def training_step(self, batch, batch_idx):
+        # ensure buffers exist
+        if not hasattr(self, "_train_losses"):
+            self._train_losses = []
+
         self._trainval_inference(batch)
 
-        # logging
+        # logging (batch-level)
         if (
             self.trainer.global_rank == 0
             and self.global_step % self.trainer.log_every_n_steps == 0
@@ -181,9 +195,7 @@ class PL_LoFTR(pl.LightningModule):
 
             # figures
             if self.config.TRAINER.ENABLE_PLOTTING:
-                compute_symmetrical_epipolar_errors(
-                    batch
-                )  # compute epi_errs for each match
+                compute_symmetrical_epipolar_errors(batch)
                 figures = make_matching_figures(
                     batch, self.config, self.config.TRAINER.PLOT_MODE
                 )
@@ -191,74 +203,71 @@ class PL_LoFTR(pl.LightningModule):
                     self.logger.experiment.add_figure(
                         f"train_match/{k}", v, self.global_step
                     )
-        return {"loss": batch["loss"]}
+                plt.close("all")
 
-    def training_epoch_end(self, outputs):
-        avg_loss = torch.stack([x["loss"] for x in outputs]).mean()
-        if self.trainer.global_rank == 0:
-            self.logger.experiment.add_scalar(
-                "train/avg_loss_on_epoch", avg_loss, global_step=self.current_epoch
-            )
+        loss = batch["loss"]
+        # stash for epoch aggregation (Lightning ≥ 2.0: don't rely on training_epoch_end outputs)
+        self._train_losses.append(loss.detach())
+        return loss
+
+    def on_train_epoch_end(self):
+        # Lightning ≥ 2.0 replacement for training_epoch_end
+        if hasattr(self, "_train_losses") and len(self._train_losses) > 0:
+            avg_loss = torch.stack(self._train_losses).mean()
+            if self.trainer.global_rank == 0:
+                self.logger.experiment.add_scalar(
+                    "train/avg_loss_on_epoch", avg_loss, global_step=self.current_epoch
+                )
+            self._train_losses.clear()
 
     def on_validation_epoch_start(self):
+        # reset per-epoch accumulators and enable validate mode for matcher
         self.matcher.fine_matching.validate = True
+        from collections import defaultdict as _dd
 
-    def validation_step(self, batch, batch_idx):
-        self._trainval_inference(batch)
+        self._val_accum = _dd(list)  # maps dataloader_idx -> list of step dicts
 
-        ret_dict, _ = self._compute_metrics(batch)
+    def on_validation_epoch_end(self):
+        # Lightning ≥ 2.0 replacement for validation_epoch_end
+        from collections import defaultdict
 
-        val_plot_interval = max(self.trainer.num_val_batches[0] // self.n_vals_plot, 1)
-        figures = {self.config.TRAINER.PLOT_MODE: []}
-        if batch_idx % val_plot_interval == 0:
-            figures = make_matching_figures(
-                batch, self.config, mode=self.config.TRAINER.PLOT_MODE
-            )
-
-        return {
-            **ret_dict,
-            "loss_scalars": batch["loss_scalars"],
-            "figures": figures,
-        }
-
-    def validation_epoch_end(self, outputs):
-        self.matcher.fine_matching.validate = False
-        # handle multiple validation sets
-        multi_outputs = (
-            [outputs] if not isinstance(outputs[0], (list, tuple)) else outputs
-        )
         multi_val_metrics = defaultdict(list)
 
-        for valset_idx, outputs in enumerate(multi_outputs):
-            # since pl performs sanity_check at the very begining of the training
-            cur_epoch = self.trainer.current_epoch
-            if (
-                not self.trainer.resume_from_checkpoint
-                and self.trainer.running_sanity_check
-            ):
-                cur_epoch = -1
+        # determine epoch index for logging (handle sanity checking)
+        cur_epoch = self.current_epoch
+        # PL 2.x uses `sanity_checking`; fall back to old name if present
+        if getattr(self.trainer, "sanity_checking", False) or getattr(
+            self.trainer, "running_sanity_check", False
+        ):
+            cur_epoch = -1
 
-            # 1. loss_scalars: dict of list, on cpu
+        # iterate over val loaders (dataloader_idx)
+        for valset_idx, outputs in sorted(self._val_accum.items()):
+            if len(outputs) == 0:
+                continue
+
+            # 1) loss_scalars: dict of list, on cpu
             _loss_scalars = [o["loss_scalars"] for o in outputs]
             loss_scalars = {
                 k: flattenList(all_gather([_ls[k] for _ls in _loss_scalars]))
                 for k in _loss_scalars[0]
             }
 
-            # 2. val metrics: dict of list, numpy
+            # 2) metrics: dict of list, numpy
             _metrics = [o["metrics"] for o in outputs]
             metrics = {
                 k: flattenList(all_gather(flattenList([_me[k] for _me in _metrics])))
                 for k in _metrics[0]
             }
-            # NOTE: all ranks need to `aggregate_merics`, but only log at rank-0
+
+            # aggregate (all ranks compute; only rank 0 writes TB)
             val_metrics_4tb = aggregate_metrics(
                 metrics, self.config.TRAINER.EPI_ERR_THR, config=self.config
             )
             for thr in [5, 10, 20]:
                 multi_val_metrics[f"auc@{thr}"].append(val_metrics_4tb[f"auc@{thr}"])
 
-            # 3. figures
+            # 3) figures
             _figures = [o["figures"] for o in outputs]
             figures = {
                 k: flattenList(gather(flattenList([_me[k] for _me in _figures])))
@@ -279,21 +288,58 @@ class PL_LoFTR(pl.LightningModule):
                     )
 
                 for k, v in figures.items():
-                    if self.trainer.global_rank == 0:
-                        for plot_idx, fig in enumerate(v):
-                            self.logger.experiment.add_figure(
-                                f"val_match_{valset_idx}/{k}/pair-{plot_idx}",
-                                fig,
-                                cur_epoch,
-                                close=True,
-                            )
+                    for plot_idx, fig in enumerate(v):
+                        self.logger.experiment.add_figure(
+                            f"val_match_{valset_idx}/{k}/pair-{plot_idx}",
+                            fig,
+                            cur_epoch,
+                            close=True,
+                        )
             plt.close("all")
 
+        # log on all ranks for ModelCheckpoint monitoring
         for thr in [5, 10, 20]:
-            # log on all ranks for ModelCheckpoint callback to work properly
-            self.log(
-                f"auc@{thr}", torch.tensor(np.mean(multi_val_metrics[f"auc@{thr}"]))
-            )  # ckpt monitors on this
+            vals = multi_val_metrics[f"auc@{thr}"]
+            if vals:
+                # put metric on the same device as the DDP backend (NCCL → GPU)
+                v = torch.tensor(float(np.mean(vals)), device=self.device)
+                self.log(
+                    f"auc@{thr}",
+                    v,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+
+        # turn off validate flag and clear accumulators
+        self.matcher.fine_matching.validate = False
+        self._val_accum.clear()
+
+    def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
+        self._trainval_inference(batch)
+        ret_dict, _ = self._compute_metrics(batch)
+
+        val_plot_interval = max(
+            self.trainer.num_val_batches[dataloader_idx] // self.n_vals_plot, 1
+        )
+        figures = {self.config.TRAINER.PLOT_MODE: []}
+        if batch_idx % val_plot_interval == 0:
+            figures = make_matching_figures(
+                batch, self.config, mode=self.config.TRAINER.PLOT_MODE
+            )
+
+        # Accumulate for epoch-end aggregation (don’t rely on validation_epoch_end outputs arg)
+        self._val_accum[dataloader_idx].append(
+            {
+                **ret_dict,
+                "loss_scalars": batch["loss_scalars"],
+                "figures": figures,
+            }
+        )
+        plt.close("all")
+        # Returning is optional; we aggregate via _val_accum
+        return
 
     def test_step(self, batch, batch_idx):
         if (self.config.LOFTR.BACKBONE_TYPE == "RepVGG") and not self.reparameter:
