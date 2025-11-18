@@ -22,11 +22,12 @@ DEFAULT_EXP_NAME=''
 EXP_NAME=${1:-${DEFAULT_EXP_NAME}}
 exp_name="outdoor-ds-${TRAIN_IMG_SIZE}-bs=$(($n_gpus_per_node * $n_nodes * $batch_size))-${EXP_NAME}"
 main_cfg_path="configs/loftr/eloftr_optimized.py"
-data_cfg_path="configs/data/megadepth_trainval_${TRAIN_IMG_SIZE}.py"
+data_cfg_path="configs/data/megadepth_trainval_832.py"
 
 python -u ./train.py \
     ${data_cfg_path} \
     ${main_cfg_path} \
+    --image_size=${TRAIN_IMG_SIZE}
     --exp_name=${exp_name} \
     --gpus=${n_gpus_per_node} --num_nodes=${n_nodes} --accelerator="cuda" \
     --batch_size=${batch_size} --num_workers=${torch_num_workers} --pin_memory=${pin_memory} \

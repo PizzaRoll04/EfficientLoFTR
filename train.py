@@ -44,6 +44,9 @@ def parse_args():
     )
     parser.add_argument("data_cfg_path", type=str, help="data config path")
     parser.add_argument("main_cfg_path", type=str, help="main config path")
+    parser.add_argument(
+        "--img_size", type=int, default=None, help="set image_size for training"
+    )
     parser.add_argument("--exp_name", type=str, default="default_exp_name")
     parser.add_argument("--batch_size", type=int, default=4, help="batch_size per gpu")
     parser.add_argument("--num_workers", type=int, default=4)
@@ -123,6 +126,9 @@ def main():
     config = get_cfg_default()
     config.merge_from_file(args.main_cfg_path)
     config.merge_from_file(args.data_cfg_path)
+
+    if args.img_size:
+        config.DATASET.MGDPT_IMG_RESIZE = args.img_size
 
     if config.LOFTR.COARSE.NPE is None:
         config.LOFTR.COARSE.NPE = [
